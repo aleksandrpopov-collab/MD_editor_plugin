@@ -229,7 +229,18 @@
     `addDocumentListener(listener, this)`) → debounce 200мс через `Alarm(SWING_THREAD, this)` → `pushContentToWeb`
     (`updateContent`, контент через `JsonPrimitive`). Флаг `applyingFromWeb` гасит эхо при нашей записи. Init теперь
     из `document.text` и тоже через JSON (вместо ручного экранирования). Скомпилировано на JDK 21, zip пересобран.
-    Визуально в IDE не проверялось.
+  - КОРНЕВАЯ ПРИЧИНА неработавшего прямого пути (найдена по логам IDE): строка инъекции в `onLoadEnd` была
+    `window.cefQuery = function(request){ ${"$"}{jsQuery.inject(...)} }` (из initial commit). В Kotlin `${"$"}`
+    даёт литерал `$`, а `{jsQuery.inject(...)}` остаётся ТЕКСТОМ → в браузер уходил невалидный JS
+    `${jsQuery.inject(...)}`, `inject()` не вызывался, `window.cefQuery` не определялась, и любой вызов из JS
+    (ping/saveDocument) молча терялся. Java→JS работал, поэтому казалось «туда — да, обратно — нет».
+    Гипотезы про deprecated `JBCefJSQuery.create` и `JS_QUERY_POOL_SIZE` оказались мимо.
+  - Фикс: собирать скрипт конкатенацией с реально вызванным `inject()`:
+    `val injected = jsQuery.inject(...); "window.cefQuery = function(request) {\n" + injected + "\n};"`.
+    Подтверждено логом: `inject()=window.cefQuery_..._1({request: ... })`, далее `bridge <- action=saveDocument`
+    → запись в Document. Плюс явный `FileDocumentManager.saveDocument` после `setText` (сброс на диск).
+    Диагностические логи и web-ping после подтверждения убраны; на актуальном API
+    (`JBCefJSQuery.create(JBCefBrowserBase)`, клиент с `JS_QUERY_POOL_SIZE`) оставлено как хорошая практика.
 
 ## План реализации
 

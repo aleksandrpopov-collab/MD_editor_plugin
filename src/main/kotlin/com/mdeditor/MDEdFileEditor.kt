@@ -5,6 +5,7 @@ import com.google.gson.JsonPrimitive
 import com.intellij.ide.ui.LafManagerListener
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.command.WriteCommandAction
+import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.editor.event.DocumentEvent
 import com.intellij.openapi.editor.event.DocumentListener
 import com.intellij.openapi.fileEditor.FileDocumentManager
@@ -15,7 +16,10 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Key
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.ui.JBColor
+import com.intellij.ui.jcef.JBCefApp
 import com.intellij.ui.jcef.JBCefBrowser
+import com.intellij.ui.jcef.JBCefBrowserBase
+import com.intellij.ui.jcef.JBCefClient
 import com.intellij.ui.jcef.JBCefJSQuery
 import com.intellij.util.Alarm
 import org.cef.CefApp
@@ -27,8 +31,18 @@ import javax.swing.JComponent
 
 class MDEdFileEditor(private val project: Project, private val file: VirtualFile) : FileEditor {
 
-    private val browser: JBCefBrowser = JBCefBrowser()
-    private val jsQuery: JBCefJSQuery = JBCefJSQuery.create(browser)
+    // The JS_QUERY_POOL_SIZE must be set on the client BEFORE the browser (and its
+    // CEF message router) is created — otherwise the injected window.cefQuery_<id>
+    // is "not a function" at call time and the JS->Java channel silently dies.
+    // A default JBCefBrowser() creates its CefBrowser eagerly, so we build the
+    // client first, set the pool, then construct the browser with that client.
+    private val client: JBCefClient = JBCefApp.getInstance().createClient().apply {
+        setProperty(JBCefClient.Properties.JS_QUERY_POOL_SIZE, 1)
+    }
+    private val browser: JBCefBrowser = JBCefBrowser.createBuilder()
+        .setClient(client)
+        .build()
+    private val jsQuery: JBCefJSQuery = JBCefJSQuery.create(browser as JBCefBrowserBase)
 
     private val document = FileDocumentManager.getInstance().getDocument(file)
 
@@ -66,6 +80,7 @@ class MDEdFileEditor(private val project: Project, private val file: VirtualFile
                 }
                 JBCefJSQuery.Response("OK")
             } catch (e: Exception) {
+                LOG.warn("MD|ed bridge: bad request: $request", e)
                 JBCefJSQuery.Response(null, 1, e.message ?: "Bad request")
             }
         }
@@ -80,12 +95,13 @@ class MDEdFileEditor(private val project: Project, private val file: VirtualFile
 
         browser.jbCefClient.addLoadHandler(object : CefLoadHandlerAdapter() {
             override fun onLoadEnd(cefBrowser: CefBrowser, frame: CefFrame, httpStatusCode: Int) {
-                // Inject the cefQuery function
-                val injectScript = """
-                    window.cefQuery = function(request) {
-                        ${"$"}{jsQuery.inject("request.request", "request.onSuccess", "request.onFailure")}
-                    };
-                """.trimIndent()
+                // Inject the cefQuery function. NOTE: build this with plain string
+                // concatenation — a Kotlin template here previously emitted the
+                // literal text "${jsQuery.inject(...)}" (invalid JS) instead of the
+                // actual query code, so window.cefQuery was never wired (JS->Java
+                // channel silently dead).
+                val injected = jsQuery.inject("request.request", "request.onSuccess", "request.onFailure")
+                val injectScript = "window.cefQuery = function(request) {\n" + injected + "\n};"
                 cefBrowser.executeJavaScript(injectScript, cefBrowser.url, 0)
                 
                 // Initialize content. Prefer the in-memory Document (may hold
@@ -125,12 +141,19 @@ class MDEdFileEditor(private val project: Project, private val file: VirtualFile
      * listener while we write, so this edit is not echoed back to the web view.
      */
     private fun writeMarkdownToDocument(markdown: String) {
-        val doc = document ?: return
+        val doc = document
+        if (doc == null) {
+            LOG.warn("MD|ed: no Document for $file — cannot save")
+            return
+        }
         ApplicationManager.getApplication().invokeLater {
             if (project.isDisposed || doc.text == markdown) return@invokeLater
             applyingFromWeb = true
             try {
                 WriteCommandAction.runWriteCommandAction(project) { doc.setText(markdown) }
+                // Flush to the .md file on disk so the change is persisted, not
+                // just held in the in-memory Document (done outside the command).
+                FileDocumentManager.getInstance().saveDocument(doc)
             } finally {
                 applyingFromWeb = false
             }
@@ -173,6 +196,9 @@ class MDEdFileEditor(private val project: Project, private val file: VirtualFile
     override fun dispose() {
         jsQuery.dispose()
         browser.dispose()
+        // We created this client ourselves (to set JS_QUERY_POOL_SIZE), so we own
+        // its disposal.
+        client.dispose()
     }
     
     override fun getFile(): VirtualFile = file
@@ -181,6 +207,8 @@ class MDEdFileEditor(private val project: Project, private val file: VirtualFile
     override fun <T : Any?> putUserData(key: Key<T>, value: T?) {}
 
     companion object {
+        private val LOG = Logger.getInstance(MDEdFileEditor::class.java)
+
         @Volatile
         private var schemeRegistered = false
 
