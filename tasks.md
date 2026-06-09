@@ -170,6 +170,67 @@
   - Не проверено визуально в IDE: подтверждено только компиляцией/сборкой; при пустом экране смотреть DevTools
     (нет ли `ERR_UNKNOWN_URL_SCHEME`/404), временный фолбэк — `-Dmded.devUrl` + dev-сервер.
 
+- [x] Двусторонняя синхронизация MD|ed ↔ файл (Document)
+  - Где проявляется: правки в MD|ed (WYSIWYG) не попадают в файл; правки в исходнике (Editor/Split) не
+    обновляют MD|ed на лету
+  - Что нужно сделать: связать веб-вью и `Document` файла в обе стороны через Java-JS мост
+  - Приоритет: высокий
+  - Причина (диагностика):
+    - Веб-вью корректно шлёт `{ action: 'saveDocument', payload: { markdown } }` (`App.tsx:46–55`,
+      debounce 500мс), НО Kotlin-обработчик `jsQuery.addHandler` (`MDEdFileEditor.kt:38–42`) — заглушка:
+      только `println` и `Response("OK")`, без записи в `Document`. Путь WYSIWYG→файл не реализован с initial commit.
+    - Обратный приёмник на веб-стороне УЖЕ есть: `App.tsx` слушает `mdeditor:update` и делает
+      `editor.commands.setContent(newMd, { emitUpdate: false })`; `main.tsx` отдаёт `MDEdBridge.updateContent`.
+      Не хватает только Kotlin `DocumentListener`, который бы при правке исходника толкал контент в веб-вью.
+    - Заметно стало из-за смены провайдера: `HIDE_OTHER_EDITORS` + дефолт `SHOW_PREVIEW` убрали из вида
+      сохранявший текстовый редактор; пользователь сразу в WYSIWYG, который не сохранял.
+  - Прямое направление (MD|ed → Document/файл):
+    - В `jsQuery.addHandler` распарсить JSON (`com.google.gson.JsonParser` — gson есть в платформе), прочитать
+      `action`; для `saveDocument` достать `payload.markdown`.
+    - Записать на EDT под write-action: `FileDocumentManager.getInstance().getDocument(file)` →
+      `WriteCommandAction.runWriteCommandAction(project) { doc.setText(md) }`. `setText` сам нормализует переводы
+      строк; markdown идёт как данные через cefQuery (не встраивается в JS-строку) — экранирование не нужно.
+    - Прочие action'ы (`registerCommand` и т.п.) оставить как есть.
+  - Обратное направление (Document → MD|ed):
+    - Повесить `DocumentListener` на документ файла: `doc.addDocumentListener(listener, this)` — `this` это
+      `MDEdFileEditor` (он `Disposable`), слушатель снимется при закрытии вкладки.
+    - В `documentChanged` (с debounce, см. ниже) пушить в веб-вью:
+      `cefBrowser.executeJavaScript("window.MDEdBridge.updateContent({markdown: <JSON>})", url, 0)`.
+      `<JSON>` формировать через gson (`JsonPrimitive(md).toString()`), чтобы кавычки/переводы строк/бэкслеши
+      не ломали JS-строку (нынешний init-скрипт экранирует руками — на больших файлах со спецсимволами это
+      хрупко; для пуша использовать корректный JSON).
+    - Первичную загрузку можно тоже брать из `Document` (`getDocument(file)?.text`), а не из
+      `file.contentsToByteArray()`, чтобы учесть несохранённые изменения в памяти.
+  - Защита от петли (ключевое):
+    - Веб-сторона уже не зацикливается: `emitUpdate:false` (нет `onUpdate` → нет `saveDocument`) + проверка
+      `newMd !== getMarkdown(editor)` (одинаковый контент не переустанавливается).
+    - На Kotlin-стороне добавить флаг ре-входимости (`@Volatile var applyingFromWeb`): выставлять вокруг
+      нашего `doc.setText(md)`; в `DocumentListener` игнорировать событие, если флаг стоит. Иначе:
+      web→Document→listener→web→onUpdate→saveDocument…
+    - Итог по направлениям: правка в MD|ed → пишем Document (наша запись, listener пропускает) → исходник в
+      Split обновляется как часть Document. Правка в исходнике → listener (флаг снят) → пуш в MD|ed →
+      `setContent(emitUpdate:false)` → сохранения не инициирует. Петли нет.
+  - Как не сломать остальное:
+    - Запись в Document — только на EDT и под `WriteCommandAction` (иначе threading-исключения и поломка Undo).
+    - Обратный пуш — с debounce (~150–300мс) и желательно только когда MD|ed НЕ в фокусе: `setContent` сбрасывает
+      курсор/выделение в WYSIWYG, не нужно дёргать его, пока в нём же печатают (а если печатают — это прямое
+      направление, обратное и так под флагом).
+    - Неидемпотентная сериализация: markdown из `Document` может чуть отличаться от вывода редактора (хвостовой
+      `\n`, нормализация) → один лишний цикл, гасится equality-гардом; проверить, что сходится, не «дёргается».
+    - `executeJavaScript` пушить с гардом `if (window.MDEdBridge && window.MDEdBridge.updateContent)` (как уже
+      сделано для init) — на случай пуша до готовности бриджа.
+    - try/catch вокруг парсинга JSON: битый ввод не должен ронять хендлер; на ошибке — `Response.error()`.
+    - `setText` помечает документ изменённым; запись на диск — штатный автосейв IDE (или явный
+      `FileDocumentManager.saveDocument(doc)` — опционально). `isModified()` без необходимости не трогать.
+  - Проверка round-trip: ввод в MD|ed → Split и файл обновились; ввод в Split → MD|ed обновился; нет дрожания/
+    петли; при переоткрытии содержимое совпадает (`window.__mdedGetMarkdown()` в dev).
+  - Сделано (`MDEdFileEditor.kt`): `saveDocument` → парс JSON (gson) → `writeMarkdownToDocument` (invokeLater на
+    EDT + `WriteCommandAction`, гард `project.isDisposed` и `doc.text == md`). `DocumentListener` (снимается через
+    `addDocumentListener(listener, this)`) → debounce 200мс через `Alarm(SWING_THREAD, this)` → `pushContentToWeb`
+    (`updateContent`, контент через `JsonPrimitive`). Флаг `applyingFromWeb` гасит эхо при нашей записи. Init теперь
+    из `document.text` и тоже через JSON (вместо ручного экранирования). Скомпилировано на JDK 21, zip пересобран.
+    Визуально в IDE не проверялось.
+
 ## План реализации
 
 - `[x]` **Этап 1: Инициализация проектов (Setup)**

@@ -1,7 +1,13 @@
 package com.mdeditor
 
+import com.google.gson.JsonParser
+import com.google.gson.JsonPrimitive
 import com.intellij.ide.ui.LafManagerListener
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.command.WriteCommandAction
+import com.intellij.openapi.editor.event.DocumentEvent
+import com.intellij.openapi.editor.event.DocumentListener
+import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.fileEditor.FileEditor
 import com.intellij.openapi.fileEditor.FileEditorLocation
 import com.intellij.openapi.fileEditor.FileEditorState
@@ -11,6 +17,7 @@ import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.ui.JBColor
 import com.intellij.ui.jcef.JBCefBrowser
 import com.intellij.ui.jcef.JBCefJSQuery
+import com.intellij.util.Alarm
 import org.cef.CefApp
 import org.cef.browser.CefBrowser
 import org.cef.browser.CefFrame
@@ -22,6 +29,17 @@ class MDEdFileEditor(private val project: Project, private val file: VirtualFile
 
     private val browser: JBCefBrowser = JBCefBrowser()
     private val jsQuery: JBCefJSQuery = JBCefJSQuery.create(browser)
+
+    private val document = FileDocumentManager.getInstance().getDocument(file)
+
+    // True while we are writing the document from a web-side edit. The document
+    // listener checks this to skip echoing our own change back to the web view
+    // (which would otherwise create a save<->update loop).
+    @Volatile
+    private var applyingFromWeb = false
+
+    // Coalesces source-side edits before pushing them to the (slower) web view.
+    private val pushAlarm = Alarm(Alarm.ThreadToUse.SWING_THREAD, this)
 
     init {
         // Self-contained by default: serve the bundled web UI over http://mded/.
@@ -36,10 +54,29 @@ class MDEdFileEditor(private val project: Project, private val file: VirtualFile
             .subscribe(LafManagerListener.TOPIC, LafManagerListener { pushTheme() })
 
         jsQuery.addHandler { request ->
-            // Parse JSON request
-            println("Received from JS: ${"$"}{request}")
-            JBCefJSQuery.Response("OK")
+            try {
+                val json = JsonParser.parseString(request).asJsonObject
+                when (json.get("action")?.asString) {
+                    // Forward sync: persist the WYSIWYG markdown into the document.
+                    "saveDocument" -> {
+                        val md = json.getAsJsonObject("payload").get("markdown").asString
+                        writeMarkdownToDocument(md)
+                    }
+                    // "registerCommand" and any future actions: acknowledged below.
+                }
+                JBCefJSQuery.Response("OK")
+            } catch (e: Exception) {
+                JBCefJSQuery.Response(null, 1, e.message ?: "Bad request")
+            }
         }
+
+        // Reverse sync: source/Split edits flow back into the WYSIWYG view.
+        document?.addDocumentListener(object : DocumentListener {
+            override fun documentChanged(event: DocumentEvent) {
+                if (applyingFromWeb) return
+                schedulePushToWeb()
+            }
+        }, this)
 
         browser.jbCefClient.addLoadHandler(object : CefLoadHandlerAdapter() {
             override fun onLoadEnd(cefBrowser: CefBrowser, frame: CefFrame, httpStatusCode: Int) {
@@ -51,15 +88,17 @@ class MDEdFileEditor(private val project: Project, private val file: VirtualFile
                 """.trimIndent()
                 cefBrowser.executeJavaScript(injectScript, cefBrowser.url, 0)
                 
-                // Initialize content
-                val content = String(file.contentsToByteArray(), Charsets.UTF_8)
-                val escapedContent = content.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
-                
+                // Initialize content. Prefer the in-memory Document (may hold
+                // unsaved edits) over the on-disk bytes. JSON-encode the string so
+                // quotes/newlines/backslashes can't break the injected JS literal.
+                val content = document?.text ?: String(file.contentsToByteArray(), Charsets.UTF_8)
+                val markdownJson = JsonPrimitive(content).toString()
+
                 val initScript = """
                     setTimeout(() => {
                         if (window.MDEdBridge && window.MDEdBridge.initDocument) {
                             window.MDEdBridge.initDocument({
-                                markdown: "$escapedContent",
+                                markdown: $markdownJson,
                                 theme: { isDark: ${isDarkTheme()} }
                             });
                         }
@@ -77,6 +116,39 @@ class MDEdFileEditor(private val project: Project, private val file: VirtualFile
     private fun pushTheme() {
         val js = "if (window.MDEdBridge && window.MDEdBridge.updateTheme) { " +
             "window.MDEdBridge.updateTheme({ isDark: ${isDarkTheme()} }); }"
+        browser.cefBrowser.executeJavaScript(js, browser.cefBrowser.url, 0)
+    }
+
+    /**
+     * Forward sync (MD|ed -> file). Runs on the EDT under a write command so it
+     * participates in IDE undo. `applyingFromWeb` suppresses the document
+     * listener while we write, so this edit is not echoed back to the web view.
+     */
+    private fun writeMarkdownToDocument(markdown: String) {
+        val doc = document ?: return
+        ApplicationManager.getApplication().invokeLater {
+            if (project.isDisposed || doc.text == markdown) return@invokeLater
+            applyingFromWeb = true
+            try {
+                WriteCommandAction.runWriteCommandAction(project) { doc.setText(markdown) }
+            } finally {
+                applyingFromWeb = false
+            }
+        }
+    }
+
+    /** Debounce source-side edits before pushing them to the web view. */
+    private fun schedulePushToWeb() {
+        pushAlarm.cancelAllRequests()
+        pushAlarm.addRequest({ pushContentToWeb() }, 200)
+    }
+
+    /** Reverse sync (file/Document -> MD|ed). */
+    private fun pushContentToWeb() {
+        val doc = document ?: return
+        val markdownJson = JsonPrimitive(doc.text).toString()
+        val js = "if (window.MDEdBridge && window.MDEdBridge.updateContent) { " +
+            "window.MDEdBridge.updateContent({ markdown: $markdownJson }); }"
         browser.cefBrowser.executeJavaScript(js, browser.cefBrowser.url, 0)
     }
 
