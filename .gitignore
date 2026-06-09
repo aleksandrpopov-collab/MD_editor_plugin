@@ -1,0 +1,21 @@
+# Gradle
+.gradle/
+build/
+
+# IntelliJ / plugin SDK
+.idea/
+.intellijPlatform/
+*.iml
+out/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Local scratch files
+Test.md
+
+# Claude Code local settings
+.claude/settings.local.json

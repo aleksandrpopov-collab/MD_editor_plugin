@@ -1,0 +1,23 @@
+<idea-plugin>
+    <id>com.mdeditor</id>
+    <name>MD|ed</name>
+    <vendor email="support@example.com" url="http://www.example.com">Example</vendor>
+
+    <description><![CDATA[
+    MD|ed is an interactive Markdown editor providing a WYSIWYG experience directly in the IDE.
+    ]]></description>
+
+    <!-- Dependencies -->
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <fileEditorProvider implementation="com.mdeditor.MDEdEditorProvider" />
+    </extensions>
+
+    <actions>
+        <action id="MDeditor.OpenAction" class="com.mdeditor.OpenMDEditorAction" text="Open at MD|ed" description="Open Markdown file in interactive editor">
+            <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>
